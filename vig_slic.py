@@ -16,6 +16,7 @@ from timm.models.registry import register_model
 from fast_slic import Slic
 from PIL import Image
 import pdb
+import PIL
 import matplotlib.pyplot as plt
 
 def _cfg(url='', **kwargs):
@@ -40,7 +41,12 @@ default_cfgs = {
     ),
 }
 
-
+# DATA_MEAN = (0.5, 0.5, 0.5)
+# DATA_STD = (0.5, 0.5, 0.5)
+DATA_MEAN = (0.485, 0.456, 0.406)
+DATA_STD = (0.229, 0.224, 0.225)
+IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 class FFN(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act='relu', drop_path=0.0):
@@ -126,48 +132,109 @@ class Stem_slic(nn.Module):
         super().__init__()
         self.numRows = numRows
         self.numSegments = numRows*numRows
-        self.mlps = nn.Sequential(
-            nn.Linear(in_dim, out_dim//8),
+        # self.mlp1 = nn.Sequential(nn.Linear(in_dim, out_dim//8))
+        self.convs = nn.Sequential(
+            nn.Conv2d(in_dim, out_dim//8, 1, stride=1, padding=0),
             nn.BatchNorm2d(out_dim//8),
             act_layer(act),
-            nn.Linear(in_dim//8, out_dim//4),
+            nn.Conv2d(out_dim//8, out_dim//4, 1, stride=1, padding=0),
             nn.BatchNorm2d(out_dim//4),
             act_layer(act),
-            nn.Linear(in_dim//4, out_dim//2),
+            nn.Conv2d(out_dim//4, out_dim//2, 1, stride=1, padding=0),
             nn.BatchNorm2d(out_dim//2),
             act_layer(act),
-            nn.Linear(in_dim//2, out_dim),
+            nn.Conv2d(out_dim//2, out_dim, 1, stride=1, padding=0),
             nn.BatchNorm2d(out_dim),
             act_layer(act),
-            nn.Linear(out_dim, out_dim),
+            nn.Conv2d(out_dim, out_dim, 1, stride=1, padding=0),
             nn.BatchNorm2d(out_dim),
         )
         self.slic = Slic(num_components=self.numSegments, compactness=compactness)    # TODO: SLIC 하는걸 여기 말고 dataloader에 추가?
         
-    def slic_init(self, x):
+    def slic_init(self, x, org_x):
         batchSize = len(x)
-        sliced = np.zeros((batchSize, x.shape[2], x.shape[3]))
+        # if isinstance(org_x, PIL.Image.Image):
+        #     org_x = np.asarray(org_x)
+        if torch.is_tensor(org_x):
+            org_x = org_x.detach().cpu().numpy().astype('uint8')
+        sliced = np.zeros((batchSize, x.shape[2], x.shape[3])).astype('int16')
+        
+        print('Processing slic on batch, batchsize: '+str(batchSize))
+        
+        if org_x.shape[-1] != 3:
+            org_x=org_x.transpose(0,2,3,1)
         for batchIdx in range(batchSize):
-            sliced[batchIdx] = self.slic.iterate(x[batchIdx].detach().cpu().numpy())
+            sliced[batchIdx] = self.slic.iterate(org_x[batchIdx].copy(order='C'))      # Iterate required input: H X W X 3
+
+        print('Processing slic on batch / Done.')
+        
         # TODO: return torch tensor with 10 x 10 x feature dimension
         x, sliced = torch.tensor(x).cuda(), torch.tensor(sliced).cuda()
         x_out = torch.zeros((batchSize,11,14,14))     # Dimension of initial SLIC map
+        
+        print('Creating x_out')
+        
         for batchIdx in range(batchSize):
-            for segIdx in self.numSegments:     # TODO: for loop 제거
+            for segIdx in range(self.numSegments):   
+                if segIdx not in sliced[batchIdx]:
+                    continue
                 idcs = (sliced[batchIdx]==segIdx).nonzero()
                 x_out[batchIdx, :2, int(segIdx/self.numRows), segIdx%self.numRows] = idcs.float().mean(0)
                 rgbs = x[batchIdx, :, idcs[:,0], idcs[:,1]]
-                x_out[batchIdx, 2:5, int(segIdx/self.numRows), segIdx%self.numRows] = rgbs.float().mean(0)  # .float() 필요 없을수도?
-                x_out[batchIdx, 5:8, int(segIdx/self.numRows), segIdx%self.numRows] = rgbs.float().std(0)  # .float() 필요 없을수도?
+                x_out[batchIdx, 2:5, int(segIdx/self.numRows), segIdx%self.numRows] = rgbs.float().mean(1) 
+                stds = rgbs.float().std(1)
+                for idx, std in enumerate(stds):
+                    stds[idx] = 0.0 if math.isnan(std) else std
+                x_out[batchIdx, 5:8, int(segIdx/self.numRows), segIdx%self.numRows] = stds
                 x_out[batchIdx, 8:11, int(segIdx/self.numRows), segIdx%self.numRows] = x[batchIdx, :, int(idcs.float().mean(0)[0]), int(idcs.float().mean(0)[1])]
-        return sliced.clone(), x_out
                 
-    def forward(self, x):
-        x_slic, x = self.slic_init(x)
-        # input dim, x: batch, 3, H, W 
-        x = self.mlps(x)
-        # x: batch, feature dimension, 14, 14
+        print('Creating x_out / Done.')
+        
+        x_out_loop = x_out.clone()
+        x_out = torch.zeros((batchSize,11,14,14))     # Dimension of initial SLIC map
+        batch_indices = torch.arange(batchSize).unsqueeze(1).unsqueeze(2).unsqueeze(3).cuda()
+        seg_indices = torch.arange(self.numSegments).unsqueeze(0).unsqueeze(2).unsqueeze(3).cuda()
+
+        seg_mask = (sliced.unsqueeze(1) == seg_indices).float()
+
+        idcs = (seg_mask.nonzero(as_tuple=False).squeeze()[:, 1:]).float().mean(0)
+        pdb.set_trace()
+        x_out[batch_indices, :2, seg_indices // self.numRows, seg_indices % self.numRows] = idcs
+
+        rgbs = x[batch_indices, :, idcs[:, 0].long(), idcs[:, 1].long()]
+        x_out[batch_indices, 2:5, seg_indices // self.numRows, seg_indices % self.numRows] = rgbs.mean(1)
+
+        stds = rgbs.std(1)
+        stds[torch.isnan(stds)] = 0.0
+        x_out[batch_indices, 5:8, seg_indices // self.numRows, seg_indices % self.numRows] = stds
+
+        mean_idcs = idcs.long()
+        x_out[batch_indices, 8:11, seg_indices // self.numRows, seg_indices % self.numRows] = x[batch_indices, :, mean_idcs[:, 0], mean_idcs[:, 1]]
+        
+        print('Creating x_out 2 / Done.')
+        pdb.set_trace()
+        return sliced.clone(), x_out.cuda()
+
+    def forward(self, x, org_x):
+        # if x.dtype!=
+        batchSize = x.shape[0]
+        x_slic, x = self.slic_init(x, org_x)        # x_slic: B, 64, 64 / x: B, 11, 14, 14
+        x = self.convs(x)
         return x_slic, x
+    
+    # def unNorm(self, img):
+    #     img[:,0,:,:] = img[:,0,:,:]*DATA_STD[0] + DATA_MEAN[0]
+    #     img[:,1,:,:] = img[:,1,:,:]*DATA_STD[1] + DATA_MEAN[1]
+    #     img[:,2,:,:] = img[:,2,:,:]*DATA_STD[2] + DATA_MEAN[2]
+    #     pdb.set_trace()
+    #     img=img*255.0
+    #     return img.int()
+    
+    # def Norm(self, img):
+    #     img[:,0,:,:] = (img[:,0,:,:] - DATA_MEAN[0]) / DATA_STD[0] 
+    #     img[:,1,:,:] = (img[:,1,:,:] - DATA_MEAN[1]) / DATA_STD[1] 
+    #     img[:,2,:,:] = (img[:,2,:,:] - DATA_MEAN[2]) / DATA_STD[2] 
+    #     return img
 
 class DeepGCN_slic(torch.nn.Module):
     def __init__(self, opt):
@@ -182,7 +249,6 @@ class DeepGCN_slic(torch.nn.Module):
         conv = opt.conv
         self.n_blocks = opt.n_blocks
         drop_path = opt.drop_path
-        
         # self.stem = Stem(out_dim=channels, act=act)
         # self.stem_tiny = Stem_tiny(out_dim=channels, act=act)
         self.Stem_slic = Stem_slic(out_dim=channels, act=act)
@@ -220,9 +286,9 @@ class DeepGCN_slic(torch.nn.Module):
                     m.bias.data.zero_()
                     m.bias.requires_grad = True
 
-    def forward(self, inputs):
+    def forward(self, inputs, originalInput):
         featMaps = []
-        x_slic, x = self.Stem_slic(inputs)
+        x_slic, x = self.Stem_slic(inputs, originalInput)
         B, C, H, W = x.shape
         
         for i in range(self.n_blocks):
@@ -295,9 +361,9 @@ class DeepGCN(torch.nn.Module):
         return self.prediction(x).squeeze(-1).squeeze(-1)
 
 @register_model
-def vig_ti_64_gelu(pretrained=False, **kwargs):         # 230525 edited
+def vig_ti_64_gelu_14by14_slic(pretrained=False, **kwargs):         # 230525 edited
     class OptInit:
-        def __init__(self, num_classes=1000, drop_path_rate=0.0, drop_rate=0.0, num_knn=9, **kwargs):
+        def __init__(self, num_classes=200, drop_path_rate=0.0, drop_rate=0.0, num_knn=9, **kwargs):
             self.k = num_knn # neighbor num (default:9)
             self.conv = 'mr' # graph conv layer {edge, mr}
             self.act = 'gelu' # activation layer {relu, prelu, leakyrelu, gelu, hswish}
@@ -313,7 +379,7 @@ def vig_ti_64_gelu(pretrained=False, **kwargs):         # 230525 edited
             self.drop_path = drop_path_rate
 
     opt = OptInit(**kwargs)
-    model = DeepGCN(opt)
+    model = DeepGCN_slic(opt)
     model.default_cfg = default_cfgs['gnn_patch16_64']
     return model
 

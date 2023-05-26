@@ -97,7 +97,7 @@ def create_loader(
         re_mode=re_mode,
         re_count=re_count,
         re_num_splits=re_num_splits,
-        separate=num_aug_splits > 0,
+        separate=True,
     )
 
     sampler = None

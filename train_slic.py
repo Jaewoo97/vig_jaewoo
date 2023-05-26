@@ -16,6 +16,7 @@ NVIDIA CUDA specific speedups adopted from NVIDIA Apex examples
 
 Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 """
+import numpy as np
 import pdb
 import warnings
 warnings.filterwarnings('ignore')
@@ -27,7 +28,7 @@ import logging
 from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime
-
+from torchvision.transforms.functional import to_pil_image
 import torch
 import torch.nn as nn
 import torchvision.utils
@@ -85,8 +86,8 @@ parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='Resume full model and optimizer state from checkpoint (default: none)')
 parser.add_argument('--no-resume-opt', action='store_true', default=False,
                     help='prevent resume of optimizer state when resuming model')
-parser.add_argument('--num-classes', type=int, default=1000, metavar='N',
-                    help='number of label classes (default: 1000)')
+parser.add_argument('--num-classes', type=int, default=200, metavar='N',
+                    help='number of label classes (default: 200)')
 parser.add_argument('--gp', default=None, type=str, metavar='POOL',
                     help='Global pool type, one of (fast, avg, max, avgmax, avgmaxc). Model default if None.')
 parser.add_argument('--img-size', type=int, default=None, metavar='N',
@@ -239,7 +240,7 @@ parser.add_argument('--log-interval', type=int, default=50, metavar='N',
 parser.add_argument('--recovery-interval', type=int, default=0, metavar='N',
                     help='how many batches to wait before writing recovery checkpoint')
 parser.add_argument('-j', '--workers', type=int, default=4, metavar='N',
-                    help='how many training processes to use (default: 1)')
+                    help='how many training processes to use (default: 4)')
 parser.add_argument('--num-gpu', type=int, default=1,
                     help='Number of GPUS to use')
 parser.add_argument('--save-images', action='store_true', default=False,
@@ -294,9 +295,10 @@ def _parse_args():
 
 
 def main():
+    print("Start training...")
     setup_default_logging()
     args, args_text = _parse_args()
-
+    
     args.prefetcher = not args.no_prefetcher
     args.distributed = False
     if 'WORLD_SIZE' in os.environ:
@@ -341,6 +343,7 @@ def main():
         bn_momentum=args.bn_momentum,
         bn_eps=args.bn_eps,
         checkpoint_path=args.initial_checkpoint)
+    data_config = resolve_data_config(vars(args), model=model, verbose=args.local_rank == 0)
         
     ################## pretrain ############
     if args.pretrain_path is not None:
@@ -350,16 +353,17 @@ def main():
         print('Pretrain weights loaded.')
     ################### flops #################
     print(model)
+    model.cuda()
     if hasattr(model, 'default_cfg'):
         default_cfg = model.default_cfg
         input_size = [1] + list(default_cfg['input_size'])
     else:
         input_size = [1, 3, 224, 224]
     input = torch.randn(input_size)#.cuda()
-    
+    inputOriginal = torch.randint(255, tuple(input_size))
     from torchprofile import profile_macs
     model.eval()
-    macs = profile_macs(model, input)
+    macs = profile_macs(model, (input, inputOriginal))
     model.train()
     print('model flops:', macs, 'input_size:', input_size)
     ##########################################
@@ -367,8 +371,6 @@ def main():
     if args.local_rank == 0:
         _logger.info('Model %s created, param count: %d' %
                      (args.model, sum([m.numel() for m in model.parameters()])))
-
-    data_config = resolve_data_config(vars(args), model=model, verbose=args.local_rank == 0)
 
     num_aug_splits = 0
     if args.aug_splits > 0:
@@ -662,7 +664,7 @@ def train_epoch(
     end = time.time()
     last_idx = len(loader) - 1
     num_updates = epoch * len(loader)
-    for batch_idx, (input, target) in enumerate(loader):
+    for batch_idx, (input, target, originalInput) in enumerate(loader):
         last_batch = batch_idx == last_idx
         data_time_m.update(time.time() - end)
         if not args.prefetcher:
@@ -673,7 +675,7 @@ def train_epoch(
             input = input.contiguous(memory_format=torch.channels_last)
 
         with amp_autocast():
-            output = model(input)
+            output, x_slic, featMaps = model(input, originalInput)
             loss = loss_fn(output, target)
 
         if not args.distributed:
@@ -755,7 +757,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
     end = time.time()
     last_idx = len(loader) - 1
     with torch.no_grad():
-        for batch_idx, (input, target) in enumerate(loader):
+        for batch_idx, (input, target, originalInput) in enumerate(loader):
             last_batch = batch_idx == last_idx
             if not args.prefetcher:
                 input = input.cuda()
@@ -764,7 +766,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                 input = input.contiguous(memory_format=torch.channels_last)
 
             with amp_autocast():
-                output = model(input)
+                output, x_slic, featMaps = model(input, originalInput)
             if isinstance(output, (tuple, list)):
                 output = output[0]
 
