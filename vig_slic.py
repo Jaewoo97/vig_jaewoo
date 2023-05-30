@@ -7,10 +7,10 @@ import torch.nn.functional as F
 from torch.nn import Sequential as Seq
 import numpy as np
 from gcn_lib import Grapher, act_layer
-from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.models.helpers import load_pretrained
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
-from timm.models.registry import register_model
+from timm_modified.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+from timm_modified.models.helpers import load_pretrained
+from timm_modified.models.layers import DropPath, to_2tuple, trunc_normal_
+from timm_modified.models.registry import register_model
 
 from fast_slic import Slic
 from PIL import Image

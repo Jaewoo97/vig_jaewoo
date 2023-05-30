@@ -36,13 +36,13 @@ import torch.nn as nn
 import torchvision.utils
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 from skimage.segmentation import mark_boundaries
-from timm.data import Dataset, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset #, create_loader
-from timm.models import create_model, resume_checkpoint, convert_splitbn_model
-from timm.utils import *
-from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy, JsdCrossEntropy
-from timm.optim import create_optimizer
-from timm.scheduler import create_scheduler
-from timm.utils import ApexScaler, NativeScaler
+from timm_modified.data import Dataset, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset #, create_loader
+from timm_modified.models import create_model, resume_checkpoint, convert_splitbn_model
+from timm_modified.utils import *
+from timm_modified.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy, JsdCrossEntropy
+from timm_modified.optim import create_optimizer
+from timm_modified.scheduler import create_scheduler
+from timm_modified.utils import ApexScaler, NativeScaler
 
 from data.myloader import create_loader
 import pyramid_vig
