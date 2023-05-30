@@ -16,8 +16,6 @@ NVIDIA CUDA specific speedups adopted from NVIDIA Apex examples
 
 Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 """
-import matplotlib.pyplot as plt
-import numpy as np
 import pdb
 import warnings
 warnings.filterwarnings('ignore')
@@ -25,17 +23,16 @@ import argparse
 import time
 import yaml
 import os
-from os.path import basename
 import logging
 from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime
-from torchvision.transforms.functional import to_pil_image
+
 import torch
 import torch.nn as nn
 import torchvision.utils
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
-from skimage.segmentation import mark_boundaries
+
 from timm.data import Dataset, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset #, create_loader
 from timm.models import create_model, resume_checkpoint, convert_splitbn_model
 from timm.utils import *
@@ -46,7 +43,7 @@ from timm.utils import ApexScaler, NativeScaler
 
 from data.myloader import create_loader
 import pyramid_vig
-import vig_slic
+import vig
 
 try:
     from apex import amp
@@ -126,7 +123,7 @@ parser.add_argument('--clip-grad', type=float, default=None, metavar='NORM',
 # Learning rate schedule parameters
 parser.add_argument('--sched', default='step', type=str, metavar='SCHEDULER',
                     help='LR scheduler (default: "step"')
-parser.add_argument('--lr', type=float, default=0.0125, metavar='LR',
+parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
                     help='learning rate (default: 0.01)')
 parser.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
                     help='learning rate noise on/off epoch percentages')
@@ -241,8 +238,8 @@ parser.add_argument('--log-interval', type=int, default=50, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--recovery-interval', type=int, default=0, metavar='N',
                     help='how many batches to wait before writing recovery checkpoint')
-parser.add_argument('-j', '--workers', type=int, default=4, metavar='N',
-                    help='how many training processes to use (default: 4)')
+parser.add_argument('-j', '--workers', type=int, default=8, metavar='N',
+                    help='how many training processes to use (default: 1)')
 parser.add_argument('--num-gpu', type=int, default=1,
                     help='Number of GPUS to use')
 parser.add_argument('--save-images', action='store_true', default=False,
@@ -297,10 +294,9 @@ def _parse_args():
 
 
 def main():
-    print("Start training...")
     setup_default_logging()
     args, args_text = _parse_args()
-    
+
     args.prefetcher = not args.no_prefetcher
     args.distributed = False
     if 'WORLD_SIZE' in os.environ:
@@ -345,7 +341,6 @@ def main():
         bn_momentum=args.bn_momentum,
         bn_eps=args.bn_eps,
         checkpoint_path=args.initial_checkpoint)
-    data_config = resolve_data_config(vars(args), model=model, verbose=args.local_rank == 0)
         
     ################## pretrain ############
     if args.pretrain_path is not None:
@@ -355,17 +350,15 @@ def main():
         print('Pretrain weights loaded.')
     ################### flops #################
     print(model)
-    model.cuda()
     if hasattr(model, 'default_cfg'):
         default_cfg = model.default_cfg
         input_size = [1] + list(default_cfg['input_size'])
     else:
         input_size = [1, 3, 224, 224]
     input = torch.randn(input_size)#.cuda()
-    inputOriginal = torch.randint(255, tuple(input_size))
     from torchprofile import profile_macs
     model.eval()
-    macs = profile_macs(model, (input, inputOriginal))
+    macs = profile_macs(model, input)
     model.train()
     print('model flops:', macs, 'input_size:', input_size)
     ##########################################
@@ -373,6 +366,8 @@ def main():
     if args.local_rank == 0:
         _logger.info('Model %s created, param count: %d' %
                      (args.model, sum([m.numel() for m in model.parameters()])))
+
+    data_config = resolve_data_config(vars(args), model=model, verbose=args.local_rank == 0)
 
     num_aug_splits = 0
     if args.aug_splits > 0:
@@ -470,6 +465,7 @@ def main():
             if args.local_rank == 0:
                 _logger.info("Using native Torch DistributedDataParallel.")
             model = NativeDDP(model, device_ids=[args.local_rank], find_unused_parameters=True)  # can use device str in Torch >= 1.1
+            # model = NativeDDP(model, device_ids=[args.local_rank])  # can use device str in Torch >= 1.1
         # NOTE: EMA model does not need to be wrapped by DDP
 
     lr_scheduler, num_epochs = create_scheduler(args, optimizer)
@@ -511,8 +507,6 @@ def main():
     train_interpolation = args.train_interpolation
     if args.no_aug or not train_interpolation:
         train_interpolation = data_config['interpolation']
-    if args.reprob != 0: 
-        raise Exception("Random erasing probability not zero")
     loader_train = create_loader(
         dataset_train,
         input_size=data_config['input_size'],
@@ -577,11 +571,11 @@ def main():
         train_loss_fn = nn.CrossEntropyLoss().cuda()
     validate_loss_fn = nn.CrossEntropyLoss().cuda()
     
-    if args.evaluate:       # Evaluate metrics, 
-        print("Start testing...")
-        eval_metrics = test(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
+    if args.evaluate:
+        eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
         print(eval_metrics)
         return
+    
     eval_metric = args.eval_metric
     best_metric = None
     best_epoch = None
@@ -601,10 +595,12 @@ def main():
             checkpoint_dir=output_dir, recovery_dir=output_dir, decreasing=decreasing)
         with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
+
     try:
         for epoch in range(start_epoch, num_epochs):
             if args.distributed:
                 loader_train.sampler.set_epoch(epoch)
+
             train_metrics = train_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args,
                 lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
@@ -616,6 +612,7 @@ def main():
                 distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
 
             eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
+
             if model_ema is not None and not args.model_ema_force_cpu:
                 if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                     distribute_bn(model_ema, args.world_size, args.dist_bn == 'reduce')
@@ -642,35 +639,6 @@ def main():
         _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
 
 
-def plot_grad_flow(named_parameters):
-    ave_grads = []
-    layers = []
-    for n, p in named_parameters:
-        if(p.requires_grad) and ("bias" not in n):
-            try: 
-                ave_grads.append(p.grad.cpu().abs().mean())
-                layers.append(n)
-                # print('p:')
-                # print(p)
-                # print('n:')
-                # print(n)
-            except:
-                print('fuck p:')
-                print(p)
-                print('fuck n:')
-                print(n)
-                continue
-            
-    plt.plot(ave_grads, alpha=0.3, color="b")
-    plt.hlines(0, 0, len(ave_grads)+1, linewidth=1, color="k" )
-    plt.xticks(range(0,len(ave_grads), 1), layers, rotation="vertical")
-    plt.xlim(xmin=0, xmax=len(ave_grads))
-    plt.xlabel("Layers")
-    plt.ylabel("average gradient")
-    plt.title("Gradient flow")
-    plt.grid(True)
-    plt.savefig('debug.png')
-    
 def train_epoch(
         epoch, model, loader, optimizer, loss_fn, args,
         lr_scheduler=None, saver=None, output_dir='', amp_autocast=suppress,
@@ -692,7 +660,7 @@ def train_epoch(
     end = time.time()
     last_idx = len(loader) - 1
     num_updates = epoch * len(loader)
-    for batch_idx, (input, target, originalInput) in enumerate(loader):
+    for batch_idx, (input, target, original_input) in enumerate(loader):
         last_batch = batch_idx == last_idx
         data_time_m.update(time.time() - end)
         if not args.prefetcher:
@@ -703,11 +671,8 @@ def train_epoch(
             input = input.contiguous(memory_format=torch.channels_last)
 
         with amp_autocast():
-            output, x_slic, featMaps = model(input, originalInput)
+            output = model(input)
             loss = loss_fn(output, target)
-            # loss += (x_slic.float()*0).mean()
-            # loss += (featMaps[0]*0).mean()
-            
 
         if not args.distributed:
             losses_m.update(loss.item(), input.size(0))
@@ -716,12 +681,8 @@ def train_epoch(
         if loss_scaler is not None:
             loss_scaler(
                 loss, optimizer, clip_grad=args.clip_grad, parameters=model.parameters(), create_graph=second_order)
-            # plot_grad_flow(model.named_parameters())
-            # pdb.set_trace()
         else:
             loss.backward(create_graph=second_order)
-            # plot_grad_flow(model.named_parameters())
-            # pdb.set_trace()
             if args.clip_grad is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
             optimizer.step()
@@ -792,8 +753,6 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
     end = time.time()
     last_idx = len(loader) - 1
     with torch.no_grad():
-        # print('stop at validate')
-        # pdb.set_trace()
         for batch_idx, (input, target, originalInput) in enumerate(loader):
             last_batch = batch_idx == last_idx
             if not args.prefetcher:
@@ -803,7 +762,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                 input = input.contiguous(memory_format=torch.channels_last)
 
             with amp_autocast():
-                output, x_slic, featMaps = model(input, originalInput)
+                output = model(input)
             if isinstance(output, (tuple, list)):
                 output = output[0]
 
@@ -814,8 +773,6 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                 target = target[0:target.size(0):reduce_factor]
 
             loss = loss_fn(output, target)
-            # loss += (x_slic*0).mean()
-            # loss += (featMaps[0]*0).mean()
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
             if args.distributed:
@@ -847,95 +804,6 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
     metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
 
     return metrics
-
-def test(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix=''):
-    # pdb.set_trace()
-    # saveFilename = os.path.basename(os.path.split(args.pretrain_path)[0])
-    # saveIdx = 1
-    # if not os.path.isdir(os.path.join('inference', saveFilename, str(saveIdx))):
-    #     os.mkdir(os.path.join('inference',saveFilename, str(saveIdx)))
-    #     baseDir = os.path.join('inference',saveFilename, str(saveIdx))
-    # else:
-    #     while os.path.isdir(os.path.join('inference', saveFilename, str(saveIdx))):
-    #         saveIdx += 1
-    #     os.mkdir(os.path.join('inference',saveFilename, str(saveIdx)))
-    #     baseDir = os.path.join('inference',saveFilename, str(saveIdx))
-    
-    
-    batch_time_m = AverageMeter()
-    losses_m = AverageMeter()
-    top1_m = AverageMeter()
-    top5_m = AverageMeter()
-
-    model.eval()
-
-    end = time.time()
-    last_idx = len(loader) - 1
-    with torch.no_grad():
-        for batch_idx, (input, target, originalInput) in enumerate(loader):
-            last_batch = batch_idx == last_idx
-            if not args.prefetcher:
-                input = input.cuda()
-                target = target.cuda()
-            if args.channels_last:
-                input = input.contiguous(memory_format=torch.channels_last)
-
-            with amp_autocast():
-                output, x_slic, featMaps = model(input, originalInput) # x_slic: x_slic
-            # pdb.set_trace()
-            # if batch_idx==5:
-            #     print("Saving raw image and slic maps")
-            #     os.mkdir(os.path.join(baseDir, 'original_image'))
-            #     os.mkdir(os.path.join(baseDir, 'SLIC_map'))
-            #     for imgIdx in range(originalInput.shape[0]):
-            #         plt.imsave((os.path.join(baseDir, 'original_image', f'batch_{batch_idx}_img_{imgIdx}.png')), originalInput[imgIdx]) # data 형식에 수정 필요할지도?
-            #         marked_img = mark_boundaries(originalInput[imgIdx], x_slic[imgIdx].detach().cpu().numpy())
-            #         plt.imsave((os.path.join(baseDir, 'SLIC_map', f'batch_{batch_idx}_img_{imgIdx}.png')), marked_img)
-                    
-            if isinstance(output, (tuple, list)):
-                output = output[0]
-
-            # augmentation reduction
-            reduce_factor = args.tta
-            if reduce_factor > 1:
-                output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
-                target = target[0:target.size(0):reduce_factor]
-
-            loss = loss_fn(output, target)
-            # loss += (x_slic*0).mean()
-            # loss += (featMaps[0]*0).mean()
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
-
-            if args.distributed:
-                reduced_loss = reduce_tensor(loss.data, args.world_size)
-                acc1 = reduce_tensor(acc1, args.world_size)
-                acc5 = reduce_tensor(acc5, args.world_size)
-            else:
-                reduced_loss = loss.data
-
-            torch.cuda.synchronize()
-
-            losses_m.update(reduced_loss.item(), input.size(0))
-            top1_m.update(acc1.item(), output.size(0))
-            top5_m.update(acc5.item(), output.size(0))
-
-            batch_time_m.update(time.time() - end)
-            end = time.time()
-            if args.local_rank == 0 and (last_batch or batch_idx % args.log_interval == 0):
-                log_name = 'Test' + log_suffix
-                _logger.info(
-                    '{0}: [{1:>4d}/{2}]  '
-                    'Time: {batch_time.val:.3f} ({batch_time.avg:.3f})  '
-                    'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
-                    'Acc@1: {top1.val:>7.4f} ({top1.avg:>7.4f})  '
-                    'Acc@5: {top5.val:>7.4f} ({top5.avg:>7.4f})'.format(
-                        log_name, batch_idx, last_idx, batch_time=batch_time_m,
-                        loss=losses_m, top1=top1_m, top5=top5_m))
-
-    metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
-
-    return metrics
-
 
 
 if __name__ == '__main__':

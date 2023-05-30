@@ -118,7 +118,7 @@ class Stem_tiny_14by14(nn.Module):     # 14 by 14
         )
 
     def forward(self, x):
-        pdb.set_trace()
+        # pdb.set_trace()
 
         x = self.convs(x)
         return x

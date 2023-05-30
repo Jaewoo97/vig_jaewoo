@@ -1,6 +1,5 @@
-# 2022.06.17-Changed for training ViG model
-#            Huawei Technologies Co., Ltd. <foss@huawei.com>
-#!/usr/bin/env python
+# V2: slic, non-slic 호환
+
 """ ImageNet Training Script
 
 This is intended to be a lean and easily modifiable ImageNet training script that reproduces ImageNet
@@ -47,7 +46,7 @@ from timm.utils import ApexScaler, NativeScaler
 from data.myloader import create_loader
 import pyramid_vig
 import vig_slic
-
+import vig
 try:
     from apex import amp
     from apex.parallel import DistributedDataParallel as ApexDDP
@@ -126,7 +125,7 @@ parser.add_argument('--clip-grad', type=float, default=None, metavar='NORM',
 # Learning rate schedule parameters
 parser.add_argument('--sched', default='step', type=str, metavar='SCHEDULER',
                     help='LR scheduler (default: "step"')
-parser.add_argument('--lr', type=float, default=0.0125, metavar='LR',
+parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
                     help='learning rate (default: 0.01)')
 parser.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
                     help='learning rate noise on/off epoch percentages')
@@ -241,8 +240,8 @@ parser.add_argument('--log-interval', type=int, default=50, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--recovery-interval', type=int, default=0, metavar='N',
                     help='how many batches to wait before writing recovery checkpoint')
-parser.add_argument('-j', '--workers', type=int, default=4, metavar='N',
-                    help='how many training processes to use (default: 4)')
+parser.add_argument('-j', '--workers', type=int, default=0, metavar='N',
+                    help='how many training processes to use (default: 0)')
 parser.add_argument('--num-gpu', type=int, default=1,
                     help='Number of GPUS to use')
 parser.add_argument('--save-images', action='store_true', default=False,
@@ -277,6 +276,7 @@ parser.add_argument('--attn_ratio', type=float, default=1.,
 parser.add_argument("--pretrain_path", default=None, type=str)
 parser.add_argument("--evaluate", action='store_true', default=False,
                     help='whether evaluate the model')
+parser.add_argument("--is_slic", action='store_true', default=False)
 
 
 def _parse_args():
@@ -297,7 +297,6 @@ def _parse_args():
 
 
 def main():
-    print("Start training...")
     setup_default_logging()
     args, args_text = _parse_args()
     
@@ -365,7 +364,10 @@ def main():
     inputOriginal = torch.randint(255, tuple(input_size))
     from torchprofile import profile_macs
     model.eval()
-    macs = profile_macs(model, (input, inputOriginal))
+    if args.is_slic:
+        macs = profile_macs(model, (input, inputOriginal))
+    else:
+        macs = profile_macs(model, input.cuda())
     model.train()
     print('model flops:', macs, 'input_size:', input_size)
     ##########################################
@@ -548,7 +550,7 @@ def main():
         if not os.path.isdir(eval_dir):
             _logger.error('Validation folder does not exist at: {}'.format(eval_dir))
             exit(1)
-    dataset_eval = Dataset(eval_dir, class_map='val_annotations.txt', train_class_to_idx=dataset_train.class_to_idx)
+    dataset_eval = Dataset(eval_dir, class_map='val_annotations.txt', train_class_to_idx=dataset_train.class_to_idx, is_slic=args.is_slic)
 
     loader_eval = create_loader(
         dataset_eval,
@@ -563,6 +565,7 @@ def main():
         distributed=args.distributed,
         crop_pct=data_config['crop_pct'],
         pin_memory=args.pin_mem,
+        is_slic=args.is_slic,
     )
 
     if args.jsd:
@@ -576,70 +579,11 @@ def main():
     else:
         train_loss_fn = nn.CrossEntropyLoss().cuda()
     validate_loss_fn = nn.CrossEntropyLoss().cuda()
-    
-    if args.evaluate:       # Evaluate metrics, 
-        print("Start testing...")
-        eval_metrics = test(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
-        print(eval_metrics)
-        return
-    eval_metric = args.eval_metric
-    best_metric = None
-    best_epoch = None
-    saver = None
-    output_dir = ''
-    if args.local_rank == 0:
-        output_base = args.output if args.output else './output'
-        exp_name = '-'.join([
-            datetime.now().strftime("%Y%m%d-%H%M%S"),
-            args.model,
-            str(data_config['input_size'][-1])
-        ])
-        output_dir = get_outdir(output_base, 'train', exp_name)
-        decreasing = True if eval_metric == 'loss' else False
-        saver = CheckpointSaver(
-            model=model, optimizer=optimizer, args=args, model_ema=model_ema, amp_scaler=loss_scaler,
-            checkpoint_dir=output_dir, recovery_dir=output_dir, decreasing=decreasing)
-        with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
-            f.write(args_text)
-    try:
-        for epoch in range(start_epoch, num_epochs):
-            if args.distributed:
-                loader_train.sampler.set_epoch(epoch)
-            train_metrics = train_epoch(
-                epoch, model, loader_train, optimizer, train_loss_fn, args,
-                lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
-                amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn)
-
-            if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
-                if args.local_rank == 0:
-                    _logger.info("Distributing BatchNorm running means and vars")
-                distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
-
-            eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
-            if model_ema is not None and not args.model_ema_force_cpu:
-                if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
-                    distribute_bn(model_ema, args.world_size, args.dist_bn == 'reduce')
-                ema_eval_metrics = validate(
-                    model_ema.ema, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast, log_suffix=' (EMA)')
-                eval_metrics = ema_eval_metrics
-
-            if lr_scheduler is not None:
-                # step LR for next epoch
-                lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
-
-            update_summary(
-                epoch, train_metrics, eval_metrics, os.path.join(output_dir, 'summary.csv'),
-                write_header=best_metric is None)
-
-            if saver is not None:
-                # save proper checkpoint with eval metric
-                save_metric = eval_metrics[eval_metric]
-                best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
-
-    except KeyboardInterrupt:
-        pass
-    if best_metric is not None:
-        _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
+    print("start validating...")
+    eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast, is_slic=args.is_slic)
+    print("final metric:")
+    print(eval_metrics)
+    return
 
 
 def plot_grad_flow(named_parameters):
@@ -655,9 +599,9 @@ def plot_grad_flow(named_parameters):
                 # print('n:')
                 # print(n)
             except:
-                print('fuck p:')
+                print('p:')
                 print(p)
-                print('fuck n:')
+                print('n:')
                 print(n)
                 continue
             
@@ -671,117 +615,7 @@ def plot_grad_flow(named_parameters):
     plt.grid(True)
     plt.savefig('debug.png')
     
-def train_epoch(
-        epoch, model, loader, optimizer, loss_fn, args,
-        lr_scheduler=None, saver=None, output_dir='', amp_autocast=suppress,
-        loss_scaler=None, model_ema=None, mixup_fn=None):
-
-    if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
-        if args.prefetcher and loader.mixup_enabled:
-            loader.mixup_enabled = False
-        elif mixup_fn is not None:
-            mixup_fn.mixup_enabled = False
-
-    second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-    batch_time_m = AverageMeter()
-    data_time_m = AverageMeter()
-    losses_m = AverageMeter()
-
-    model.train()
-
-    end = time.time()
-    last_idx = len(loader) - 1
-    num_updates = epoch * len(loader)
-    for batch_idx, (input, target, originalInput) in enumerate(loader):
-        last_batch = batch_idx == last_idx
-        data_time_m.update(time.time() - end)
-        if not args.prefetcher:
-            input, target = input.cuda(), target.cuda()
-            if mixup_fn is not None:
-                input, target = mixup_fn(input, target)
-        if args.channels_last:
-            input = input.contiguous(memory_format=torch.channels_last)
-
-        with amp_autocast():
-            output, x_slic, featMaps = model(input, originalInput)
-            loss = loss_fn(output, target)
-            # loss += (x_slic.float()*0).mean()
-            # loss += (featMaps[0]*0).mean()
-            
-
-        if not args.distributed:
-            losses_m.update(loss.item(), input.size(0))
-
-        optimizer.zero_grad()
-        if loss_scaler is not None:
-            loss_scaler(
-                loss, optimizer, clip_grad=args.clip_grad, parameters=model.parameters(), create_graph=second_order)
-            # plot_grad_flow(model.named_parameters())
-            # pdb.set_trace()
-        else:
-            loss.backward(create_graph=second_order)
-            # plot_grad_flow(model.named_parameters())
-            # pdb.set_trace()
-            if args.clip_grad is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-            optimizer.step()
-
-        torch.cuda.synchronize()
-        if model_ema is not None:
-            model_ema.update(model)
-        num_updates += 1
-
-        batch_time_m.update(time.time() - end)
-        if last_batch or batch_idx % args.log_interval == 0:
-            lrl = [param_group['lr'] for param_group in optimizer.param_groups]
-            lr = sum(lrl) / len(lrl)
-
-            if args.distributed:
-                reduced_loss = reduce_tensor(loss.data, args.world_size)
-                losses_m.update(reduced_loss.item(), input.size(0))
-
-            if args.local_rank == 0:
-                _logger.info(
-                    'Train: {} [{:>4d}/{} ({:>3.0f}%)]  '
-                    'Loss: {loss.val:>9.6f} ({loss.avg:>6.4f})  '
-                    'Time: {batch_time.val:.3f}s, {rate:>7.2f}/s  '
-                    '({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  '
-                    'LR: {lr:.3e}  '
-                    'Data: {data_time.val:.3f} ({data_time.avg:.3f})'.format(
-                        epoch,
-                        batch_idx, len(loader),
-                        100. * batch_idx / last_idx,
-                        loss=losses_m,
-                        batch_time=batch_time_m,
-                        rate=input.size(0) * args.world_size / batch_time_m.val,
-                        rate_avg=input.size(0) * args.world_size / batch_time_m.avg,
-                        lr=lr,
-                        data_time=data_time_m))
-
-                if args.save_images and output_dir:
-                    torchvision.utils.save_image(
-                        input,
-                        os.path.join(output_dir, 'train-batch-%d.jpg' % batch_idx),
-                        padding=0,
-                        normalize=True)
-
-        if saver is not None and args.recovery_interval and (
-                last_batch or (batch_idx + 1) % args.recovery_interval == 0):
-            saver.save_recovery(epoch, batch_idx=batch_idx)
-
-        if lr_scheduler is not None:
-            lr_scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
-
-        end = time.time()
-        # end for
-
-    if hasattr(optimizer, 'sync_lookahead'):
-        optimizer.sync_lookahead()
-
-    return OrderedDict([('loss', losses_m.avg)])
-
-
-def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix=''):
+def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='', is_slic=True):
     batch_time_m = AverageMeter()
     losses_m = AverageMeter()
     top1_m = AverageMeter()
@@ -803,7 +637,10 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                 input = input.contiguous(memory_format=torch.channels_last)
 
             with amp_autocast():
-                output, x_slic, featMaps = model(input, originalInput)
+                if is_slic:
+                    output, x_slic, featMaps = model(input, originalInput)
+                else:
+                    output = model(input)
             if isinstance(output, (tuple, list)):
                 output = output[0]
 
@@ -848,93 +685,6 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
 
     return metrics
 
-def test(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix=''):
-    # pdb.set_trace()
-    # saveFilename = os.path.basename(os.path.split(args.pretrain_path)[0])
-    # saveIdx = 1
-    # if not os.path.isdir(os.path.join('inference', saveFilename, str(saveIdx))):
-    #     os.mkdir(os.path.join('inference',saveFilename, str(saveIdx)))
-    #     baseDir = os.path.join('inference',saveFilename, str(saveIdx))
-    # else:
-    #     while os.path.isdir(os.path.join('inference', saveFilename, str(saveIdx))):
-    #         saveIdx += 1
-    #     os.mkdir(os.path.join('inference',saveFilename, str(saveIdx)))
-    #     baseDir = os.path.join('inference',saveFilename, str(saveIdx))
-    
-    
-    batch_time_m = AverageMeter()
-    losses_m = AverageMeter()
-    top1_m = AverageMeter()
-    top5_m = AverageMeter()
-
-    model.eval()
-
-    end = time.time()
-    last_idx = len(loader) - 1
-    with torch.no_grad():
-        for batch_idx, (input, target, originalInput) in enumerate(loader):
-            last_batch = batch_idx == last_idx
-            if not args.prefetcher:
-                input = input.cuda()
-                target = target.cuda()
-            if args.channels_last:
-                input = input.contiguous(memory_format=torch.channels_last)
-
-            with amp_autocast():
-                output, x_slic, featMaps = model(input, originalInput) # x_slic: x_slic
-            # pdb.set_trace()
-            # if batch_idx==5:
-            #     print("Saving raw image and slic maps")
-            #     os.mkdir(os.path.join(baseDir, 'original_image'))
-            #     os.mkdir(os.path.join(baseDir, 'SLIC_map'))
-            #     for imgIdx in range(originalInput.shape[0]):
-            #         plt.imsave((os.path.join(baseDir, 'original_image', f'batch_{batch_idx}_img_{imgIdx}.png')), originalInput[imgIdx]) # data 형식에 수정 필요할지도?
-            #         marked_img = mark_boundaries(originalInput[imgIdx], x_slic[imgIdx].detach().cpu().numpy())
-            #         plt.imsave((os.path.join(baseDir, 'SLIC_map', f'batch_{batch_idx}_img_{imgIdx}.png')), marked_img)
-                    
-            if isinstance(output, (tuple, list)):
-                output = output[0]
-
-            # augmentation reduction
-            reduce_factor = args.tta
-            if reduce_factor > 1:
-                output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
-                target = target[0:target.size(0):reduce_factor]
-
-            loss = loss_fn(output, target)
-            # loss += (x_slic*0).mean()
-            # loss += (featMaps[0]*0).mean()
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
-
-            if args.distributed:
-                reduced_loss = reduce_tensor(loss.data, args.world_size)
-                acc1 = reduce_tensor(acc1, args.world_size)
-                acc5 = reduce_tensor(acc5, args.world_size)
-            else:
-                reduced_loss = loss.data
-
-            torch.cuda.synchronize()
-
-            losses_m.update(reduced_loss.item(), input.size(0))
-            top1_m.update(acc1.item(), output.size(0))
-            top5_m.update(acc5.item(), output.size(0))
-
-            batch_time_m.update(time.time() - end)
-            end = time.time()
-            if args.local_rank == 0 and (last_batch or batch_idx % args.log_interval == 0):
-                log_name = 'Test' + log_suffix
-                _logger.info(
-                    '{0}: [{1:>4d}/{2}]  '
-                    'Time: {batch_time.val:.3f} ({batch_time.avg:.3f})  '
-                    'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
-                    'Acc@1: {top1.val:>7.4f} ({top1.avg:>7.4f})  '
-                    'Acc@5: {top5.val:>7.4f} ({top5.avg:>7.4f})'.format(
-                        log_name, batch_idx, last_idx, batch_time=batch_time_m,
-                        loss=losses_m, top1=top1_m, top5=top5_m))
-
-    metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
-
-    return metrics
 
 
 

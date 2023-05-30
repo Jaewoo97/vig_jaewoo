@@ -22,6 +22,7 @@ for idx, img in enumerate(selected_imgs):
     assignment = fastslic.iterate(image) # Cluster Map
     if segments.max() != 169: print('idx: '+str(idx)+', scipy slic error: '+str(segments.max()))
     if segments.max() != 169: print('idx: '+str(idx)+', fast slic error: '+str(assignment.max()))
+    pdb.set_trace()
     continue
     pdb.set_trace()
     

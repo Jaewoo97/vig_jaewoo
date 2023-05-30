@@ -71,7 +71,8 @@ def create_loader(
         fp16=False,
         tf_preprocessing=False,
         use_multi_epochs_loader=False,
-        repeated_aug=False
+        repeated_aug=False,
+        is_slic=True
 ):
     re_num_splits = 0
     if re_split:

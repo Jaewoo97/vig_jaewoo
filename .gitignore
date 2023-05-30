@@ -4,3 +4,4 @@ ILSVRC/**
 imagenet/**
 output/**
 tinyImagenet/**
+inference/**
